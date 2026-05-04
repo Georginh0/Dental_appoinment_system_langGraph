@@ -1,38 +1,36 @@
-# DentAI Pro v2 — Python Dependencies
-# ==========================================================
-# SETUP:
+# DentAI Pro — Production Requirements
+# =====================================
+# Install: pip install -r requirements.txt
+#
+# Local dev setup:
 #   conda create -n dentai python=3.11 -y
 #   conda activate dentai
 #   pip install -r requirements.txt
-# ==========================================================
 
-# ── LangGraph + LangChain ──
+# ── LangGraph / LangChain ──────────────────────────────────
 langgraph>=0.2.0
 langchain>=0.2.0
-langchain-openai>=0.1.0
 langchain-core>=0.2.0
+langchain-groq>=0.1.9          # Groq integration (free LLM)
 
-# ── OpenAI ──
-openai>=1.30.0
+# ── Database — Supabase / PostgreSQL ───────────────────────
+psycopg2-binary>=2.9.9         # PostgreSQL driver
 
-# ── MySQL connector ──
-mysql-connector-python>=8.3.0
+# ── Web frameworks ─────────────────────────────────────────
+fastapi>=0.111.0               # WhatsApp + Telegram webhooks
+uvicorn[standard]>=0.29.0      # ASGI server
+streamlit>=1.35.0              # Web UI
 
-# ── Environment management ──
-python-dotenv>=1.0.0
+# ── Messaging integrations ─────────────────────────────────
+twilio>=9.0.0                  # WhatsApp Business API
+python-telegram-bot>=20.7      # Telegram Bot API
 
-# ── Streamlit UI ──
-streamlit>=1.35.0
+# ── Utilities ──────────────────────────────────────────────
+python-dotenv>=1.0.0           # .env file loading
+httpx>=0.27.0                  # Async HTTP (used by integrations)
 
-# ── Data processing ──
-pandas>=2.0.0
-
-# ── Testing ──
-pytest>=8.0.0
-
-
-chromadb>=0.5.0          
-sqlalchemy>=2.0.0        
-fastapi>=0.111.0        
-uvicorn>=0.29.0          # ASGI server
-twilio>=9.0.0            # SMS reminders
+# ── Development / testing (not needed on Render) ───────────
+# pytest>=8.0.0
+# pytest-asyncio>=0.23.0
+# black>=24.0.0
+# ruff>=0.4.0

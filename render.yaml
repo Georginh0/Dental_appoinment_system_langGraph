@@ -1,0 +1,82 @@
+# render.yaml — Render.com Deployment Configuration
+# =====================================================
+# Deploys three services from one repo:
+#   1. streamlit  — Web UI (public-facing)
+#   2. whatsapp   — Twilio WhatsApp webhook
+#   3. telegram   — Telegram webhook
+#
+# HOW TO DEPLOY:
+#   1. Push this repo to GitHub
+#   2. Go to render.com → New → Blueprint
+#   3. Connect your GitHub repo
+#   4. Render reads this file and creates all services
+#   5. Add environment variables in Render dashboard
+#      (or they'll be prompted from envVarGroups below)
+
+services:
+
+  # ── 1. Streamlit Web App ─────────────────────────────────
+  - type: web
+    name: dentai-streamlit
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: >
+      streamlit run streamlit_app.py
+      --server.port $PORT
+      --server.address 0.0.0.0
+      --server.headless true
+      --browser.gatherUsageStats false
+    healthCheckPath: /_stcore/health
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false                   # set manually in Render dashboard
+      - key: DATABASE_URL
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+    autoDeploy: true
+    plan: free                        # upgrade to starter for always-on
+
+  # ── 2. WhatsApp Bot (FastAPI webhook) ────────────────────
+  - type: web
+    name: dentai-whatsapp
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn integrations.whatsapp_bot:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_WHATSAPP_NUMBER
+        value: "whatsapp:+14155238886"   # replace with your number
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+    autoDeploy: true
+    plan: free
+
+  # ── 3. Telegram Bot (FastAPI webhook) ───────────────────
+  - type: web
+    name: dentai-telegram
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn integrations.telegram_bot:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_WEBHOOK_SECRET
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+    autoDeploy: true
+    plan: free

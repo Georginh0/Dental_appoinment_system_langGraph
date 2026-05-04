@@ -1,171 +1,142 @@
 """
+db_connection.py — PostgreSQL / Supabase Connection Manager
 ============================================================
-  db_connection.py — MySQL Connection Manager
-  DentAI Pro | Shared by all scripts
+Replaces the MySQL connector. Supabase uses PostgreSQL under the hood.
 
-  USAGE:
-    from scripts.db_connection import get_db, DBManager
+USAGE:
+    from scripts.db_connection import DBManager
 
-    # Simple connection
-    conn = get_db()
-    cursor = conn.cursor(dictionary=True)
-
-    # Context manager (auto-closes)
     with DBManager() as db:
-        results = db.query("SELECT * FROM doctors")
-============================================================
+        rows  = db.query("SELECT * FROM doctors WHERE specialization = %s", ("orthodontist",))
+        one   = db.query_one("SELECT * FROM patients WHERE patient_id = %s", (1000048,))
+        rowid = db.execute("INSERT INTO appointments (...) VALUES (%s, %s)", (...))
+
+SETUP:
+    Add to .env:
+        DATABASE_URL="postgresql://postgres.cizfjikkjhziqizkvvbb:sYfhih-rexxej-4xigra@aws-1-eu-west-2.pooler.supabase.com:5432/postgres"
+
+    Get this string from:
+        Supabase → Project Settings → Database → Connection string (Transaction mode)
 """
 
-import os
-import sys
+from __future__ import annotations
+
 import logging
-from typing import Any, Optional
+import os
 from contextlib import contextmanager
-import mysql.connector
-from mysql.connector import Error, MySQLConnection
+from typing import Any, Optional
+
+import psycopg2
+import psycopg2.extras
 from dotenv import load_dotenv
 
 load_dotenv()
 
 log = logging.getLogger("dentai.db")
 
-# ── Connection config ──────────────────────────────────────
-# These read from your .env file first, then fall back to defaults.
-# Create a .env file in the project root:
-#
-#   MYSQL_HOST=localhost
-#   MYSQL_PORT=3306
-#   MYSQL_USER=root
-#   MYSQL_PASSWORD=your_password_here
-#   MYSQL_DATABASE=dentai_pro
+# ── Connection ─────────────────────────────────────────────
 
-DB_CONFIG = {
-    "host": os.getenv("MYSQL_HOST", "localhost"),
-    "port": int(os.getenv("MYSQL_PORT", "3306")),
-    "user": os.getenv("MYSQL_USER", "root"),
-    "password": os.getenv("MYSQL_PASSWORD", ""),
-    "database": os.getenv("MYSQL_DATABASE", "dentai_pro"),
-    "charset": "utf8mb4",
-    "autocommit": False,
-    "connection_timeout": 10,
-}
-
-
-def get_db() -> MySQLConnection:
+def _get_connection() -> psycopg2.extensions.connection:
     """
-    Return a live MySQL connection.
-
-    Example:
-        conn = get_db()
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT * FROM doctors")
-        rows = cursor.fetchall()
-        conn.close()
+    Open a raw psycopg2 connection from DATABASE_URL.
+    Supabase transaction-mode pooler (port 6543) is recommended for serverless.
     """
-    try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        return conn
-    except Error as e:
-        log.error(f"MySQL connection failed: {e}")
-        raise ConnectionError(
-            f"Cannot connect to MySQL.\n"
-            f"Host: {DB_CONFIG['host']}:{DB_CONFIG['port']}\n"
-            f"Database: {DB_CONFIG['database']}\n"
-            f"Error: {e}\n\n"
-            f"Fix:\n"
-            f"  1. Is MySQL running? (mysql.server start OR XAMPP)\n"
-            f"  2. Check your .env file has the correct password\n"
-            f"  3. Did you run 01_mysql_setup.sql?\n"
+    url = os.environ.get("DATABASE_URL")
+    if not url:
+        raise EnvironmentError(
+            "\n  DATABASE_URL not set.\n"
+            "  Add to .env:\n"
+            "    DATABASE_URL=\"postgresql://postgres.cizfjikkjhziqizkvvbb:sYfhih-rexxej-4xigra@aws-1-eu-west-2.pooler.supabase.com:5432/postgres\"\n"
+            "  Get it from: Supabase → Project Settings → Database → Connection string\n"
         )
+    return psycopg2.connect(url, cursor_factory=psycopg2.extras.RealDictCursor)
 
+
+# ── Context-manager wrapper ────────────────────────────────
 
 class DBManager:
     """
-    Context-manager wrapper for MySQL connections.
-    Automatically commits on success, rolls back on error, closes on exit.
+    Context manager that wraps a single psycopg2 connection.
 
-    Usage:
+    • Auto-commits on clean exit
+    • Auto-rollbacks on exception
+    • Returns rows as plain dicts (RealDictCursor)
+
+    Example:
         with DBManager() as db:
-            results = db.query("SELECT * FROM doctors WHERE specialization=%s",
-                               ("orthodontist",))
-            db.execute("UPDATE doctor_availability SET is_available=%s WHERE slot_id=%s",
-                       (False, 42))
+            rows = db.query("SELECT * FROM doctors")
     """
 
-    def __init__(self):
-        self.conn: Optional[MySQLConnection] = None
+    def __init__(self) -> None:
+        self._conn: Optional[psycopg2.extensions.connection] = None
 
-    def __enter__(self):
-        self.conn = get_db()
+    def __enter__(self) -> "DBManager":
+        self._conn = _get_connection()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.conn:
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        if self._conn:
             if exc_type:
-                self.conn.rollback()
-                log.error(f"DB transaction rolled back due to: {exc_val}")
+                self._conn.rollback()
+                log.error("DB rollback due to: %s — %s", exc_type.__name__, exc_val)
             else:
-                self.conn.commit()
-            self.conn.close()
-        return False  # Don't suppress exceptions
+                self._conn.commit()
+            self._conn.close()
+        return False  # never swallow exceptions
+
+    # ── Query helpers ───────────────────────────────────────
 
     def query(self, sql: str, params: tuple = ()) -> list[dict]:
-        """Execute a SELECT and return list of row dicts."""
-        cursor = self.conn.cursor(dictionary=True)
-        cursor.execute(sql, params)
-        rows = cursor.fetchall()
-        cursor.close()
-        return rows
+        """Execute SELECT → list of row dicts."""
+        with self._conn.cursor() as cur:
+            cur.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]
 
     def query_one(self, sql: str, params: tuple = ()) -> Optional[dict]:
-        """Execute a SELECT and return single row dict or None."""
-        cursor = self.conn.cursor(dictionary=True)
-        cursor.execute(sql, params)
-        row = cursor.fetchone()
-        cursor.close()
-        return row
+        """Execute SELECT → single row dict or None."""
+        with self._conn.cursor() as cur:
+            cur.execute(sql, params)
+            row = cur.fetchone()
+            return dict(row) if row else None
 
     def execute(self, sql: str, params: tuple = ()) -> int:
-        """Execute INSERT/UPDATE/DELETE, return lastrowid or rowcount."""
-        cursor = self.conn.cursor()
-        cursor.execute(sql, params)
-        result = cursor.lastrowid or cursor.rowcount
-        cursor.close()
-        return result
+        """
+        Execute INSERT / UPDATE / DELETE.
+        Returns lastrowid for INSERT (via RETURNING id), else rowcount.
+        """
+        with self._conn.cursor() as cur:
+            # Append RETURNING id for INSERT statements so callers get the new PK
+            if sql.strip().upper().startswith("INSERT") and "RETURNING" not in sql.upper():
+                cur.execute(sql + " RETURNING id", params)
+                row = cur.fetchone()
+                return dict(row)["id"] if row else 0
+            else:
+                cur.execute(sql, params)
+                return cur.rowcount
 
     def executemany(self, sql: str, data: list[tuple]) -> int:
-        """Execute batch INSERT/UPDATE, return rowcount."""
-        cursor = self.conn.cursor()
-        cursor.executemany(sql, data)
-        count = cursor.rowcount
-        cursor.close()
-        return count
+        """Batch insert / update."""
+        with self._conn.cursor() as cur:
+            psycopg2.extras.execute_batch(cur, sql, data, page_size=500)
+            return cur.rowcount
 
-    def call_proc(self, proc_name: str, args: tuple) -> tuple:
-        """Call a stored procedure and return output args."""
-        cursor = self.conn.cursor()
-        result = cursor.callproc(proc_name, args)
-        cursor.close()
-        return result
 
+# ── Quick connectivity test ────────────────────────────────
 
 def test_connection() -> bool:
-    """Quick connectivity test — run this to verify your setup."""
+    """Run from terminal: python -c 'from scripts.db_connection import test_connection; test_connection()'"""
     try:
-        conn = get_db()
-        cursor = conn.cursor()
-        cursor.execute("SELECT VERSION(), DATABASE()")
-        version, db = cursor.fetchone()
-        print(f"✅ Connected! MySQL {version} | Database: {db}")
-        cursor.execute("SHOW TABLES")
-        tables = [row[0] for row in cursor.fetchall()]
-        print(
-            f"   Tables found: {', '.join(tables) if tables else 'NONE (run 01_mysql_setup.sql!)'}"
-        )
-        conn.close()
+        with DBManager() as db:
+            row = db.query_one("SELECT version() AS v, current_database() AS db")
+            print(f"  Connected  |  {row['v'][:40]}  |  DB: {row['db']}")
+            tables = db.query(
+                "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename"
+            )
+            names = [t["tablename"] for t in tables]
+            print(f"  Tables: {', '.join(names) if names else 'none — run 01_supabase_setup.sql'}")
         return True
-    except Exception as e:
-        print(f"❌ Connection test failed: {e}")
+    except Exception as exc:
+        print(f"  FAILED: {exc}")
         return False
 
 

@@ -1,0 +1,64 @@
+# Environment & secrets — NEVER commit these
+.env
+*.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.conda/
+
+# IDE
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+.DS_Store?
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+dentai_agent.log
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Data (keep .gitkeep, exclude CSV if it contains real patient data)
+# data/doctor_availability.csv   # uncomment if CSV has real PHI
+
+# Chroma vector DB (if added)
+chroma_db/
+
+# Streamlit cache
+.streamlit/
+
+# Test artifacts
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# Temporary
+tmp/
+temp/
+.DS_Store
