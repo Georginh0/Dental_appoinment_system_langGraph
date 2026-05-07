@@ -1,19 +1,18 @@
+from __future__ import annotations
 """
 dental_agent.py — DentAI Pro Core Agent
 ========================================
 LangGraph multi-agent system with 7 tools.
 LLM  : Groq (llama-3.3-70b-versatile) — free, ~300 tok/s
 DB   : Supabase / PostgreSQL
-UI   : channel-agnostic — called by Streamlit, WhatsApp, Telegram
+
 
 PUBLIC API:
-    from scripts.dental_agent import run_agent, build_graph, DentalState
+    from scripts.dental_agent import run_agent, SPECIALIZATIONS
 
-    result = run_agent("Book a cleaning next Thursday", session_id="abc123", channel="web")
-    reply  = result["reply"]   # plain-text response for any channel
+    result = run_agent("Book a cleaning next Thursday", session_id="abc", channel="web")
+    reply  = result["reply"]
 """
-
-from __future__ import annotations
 
 import json
 import logging
@@ -64,7 +63,6 @@ SPECIALIZATIONS: dict[str, str] = {
     "emergency_dentist": "Severe toothache, broken tooth, knocked-out tooth, abscess",
 }
 
-# Longer phrases first to prevent partial-match false positives
 EMERGENCY_KEYWORDS: tuple[str, ...] = (
     "difficulty breathing", "difficulty swallowing", "spreading swelling",
     "severe pain", "extreme pain", "excruciating", "knocked out",
@@ -113,11 +111,6 @@ _SPECS_JSON = json.dumps(SPECIALIZATIONS, indent=2)
 # ──────────────────────────────────────────────────────────
 
 def get_llm(temperature: float = 0.3) -> ChatGroq:
-    """
-    Return Groq LLM. Free tier. ~300 tok/s.
-    Get key at: https://console.groq.com  → API Keys → Create
-    Add GROQ_API_KEY to .env
-    """
     key = os.environ.get("GROQ_API_KEY")
     if not key:
         raise EnvironmentError(
@@ -134,7 +127,7 @@ def get_llm(temperature: float = 0.3) -> ChatGroq:
 class DentalState(TypedDict):
     messages:                Annotated[list[BaseMessage], operator.add]
     session_id:              str
-    channel:                 str          # web | whatsapp | telegram
+    channel:                 str
     is_emergency:            bool
     detected_intent:         str
     detected_specialization: Optional[str]
@@ -143,7 +136,12 @@ class DentalState(TypedDict):
     analytics:               list[str]
 
 
-def make_state(message: str, session_id: str, channel: str = "web") -> DentalState:
+def make_state(
+    message: str,
+    session_id: str,
+    channel: str = "web",
+    patient_id: Optional[int] = None,
+) -> DentalState:
     return DentalState(
         messages=[HumanMessage(content=message)],
         session_id=session_id,
@@ -151,7 +149,7 @@ def make_state(message: str, session_id: str, channel: str = "web") -> DentalSta
         is_emergency=False,
         detected_intent="general",
         detected_specialization=None,
-        patient_id=None,
+        patient_id=patient_id,
         current_node="start",
         analytics=[],
     )
@@ -212,20 +210,26 @@ def get_availability(
 
         if not rows:
             suffix = f" with {specialization}" if specialization else ""
-            return json.dumps({"status": "no_slots", "date": target_date,
-                               "message": f"No slots on {target_date}{suffix}. Try a different date."})
+            return json.dumps({
+                "status": "no_slots", "date": target_date,
+                "message": f"No slots on {target_date}{suffix}. Try a different date.",
+            })
 
         by_doc: dict[str, dict] = {}
         for r in rows:
             doc = r["doctor_name"]
             if doc not in by_doc:
-                by_doc[doc] = {"doctor": doc, "specialization": r["specialization"],
-                               "date": str(r["slot_date"]), "day": r["day_name"],
-                               "available_times": []}
+                by_doc[doc] = {
+                    "doctor": doc, "specialization": r["specialization"],
+                    "date": str(r["slot_date"]), "day": r["day_name"],
+                    "available_times": [],
+                }
             by_doc[doc]["available_times"].append(str(r["time_slot"])[:5])
 
-        return json.dumps({"status": "ok", "date": target_date,
-                           "total_slots": len(rows), "doctors": list(by_doc.values())}, default=str)
+        return json.dumps({
+            "status": "ok", "date": target_date,
+            "total_slots": len(rows), "doctors": list(by_doc.values()),
+        }, default=str)
 
     except Exception as exc:
         log.error("get_availability: %s", exc)
@@ -259,21 +263,30 @@ def get_patient_appointments(patient_id: int) -> str:
             )
 
         if not patient and not appts:
-            return json.dumps({"status": "not_found", "message": f"No records for patient {patient_id}."})
+            return json.dumps({"status": "not_found",
+                               "message": f"No records for patient {patient_id}."})
 
         name = "Unknown"
         insurance = "Unknown"
         if patient:
-            name = f"{patient.get('first_name','') or ''} {patient.get('last_name','') or ''}".strip() or "Unknown"
+            name = (
+                f"{patient.get('first_name') or ''} {patient.get('last_name') or ''}".strip()
+                or "Unknown"
+            )
             insurance = patient.get("insurance") or "Unknown"
 
         return json.dumps({
             "status": "ok",
             "patient": {"id": patient_id, "name": name, "insurance": insurance},
-            "appointments": [{"id": a["id"], "date": str(a["appointment_dt"])[:16],
-                              "doctor": a["doctor_name"], "specialty": a["specialization"],
-                              "status": a["status"], "reason": a["reason"],
-                              "confirmation": a["confirmation_code"]} for a in appts],
+            "appointments": [
+                {
+                    "id": a["id"], "date": str(a["appointment_dt"])[:16],
+                    "doctor": a["doctor_name"], "specialty": a["specialization"],
+                    "status": a["status"], "reason": a["reason"],
+                    "confirmation": a["confirmation_code"],
+                }
+                for a in appts
+            ],
             "total": len(appts),
         }, default=str)
 
@@ -307,13 +320,17 @@ def check_slot_available(doctor_name: str, date_slot: str) -> str:
             )
 
         if not row:
-            return json.dumps({"status": "slot_not_found",
-                               "message": f"No schedule entry for Dr. {doctor_name} at {date_slot}."})
+            return json.dumps({
+                "status": "slot_not_found",
+                "message": f"No schedule entry for Dr. {doctor_name} at {date_slot}.",
+            })
 
         if row["is_available"]:
-            return json.dumps({"status": "available", "doctor": doctor_name,
-                               "datetime": date_slot, "specialization": row["specialization"],
-                               "message": f"Slot is free — Dr. {doctor_name} at {date_slot}."})
+            return json.dumps({
+                "status": "available", "doctor": doctor_name,
+                "datetime": date_slot, "specialization": row["specialization"],
+                "message": f"Slot is free — Dr. {doctor_name} at {date_slot}.",
+            })
 
         with DBManager() as db:
             nxt = db.query(
@@ -324,10 +341,11 @@ def check_slot_available(doctor_name: str, date_slot: str) -> str:
                 (doctor_name.lower(), date_slot),
             )
 
-        return json.dumps({"status": "taken", "doctor": doctor_name, "datetime": date_slot,
-                           "message": "That slot is already booked.",
-                           "next_available": [f"{s['d']} at {str(s['t'])[:5]}" for s in nxt]},
-                          default=str)
+        return json.dumps({
+            "status": "taken", "doctor": doctor_name, "datetime": date_slot,
+            "message": "That slot is already booked.",
+            "next_available": [f"{s['d']} at {str(s['t'])[:5]}" for s in nxt],
+        }, default=str)
 
     except Exception as exc:
         log.error("check_slot_available: %s", exc)
@@ -380,17 +398,29 @@ def list_doctors_by_specialization(specialization: str) -> str:
                 )
 
             if not doctors:
-                all_specs = db.query("SELECT DISTINCT specialization FROM doctors ORDER BY specialization")
-                return json.dumps({"status": "not_found", "message": f"No doctors for '{specialization}'.",
-                                   "available": [r["specialization"] for r in all_specs],
-                                   "what_each_treats": SPECIALIZATIONS})
+                all_specs = db.query(
+                    "SELECT DISTINCT specialization FROM doctors ORDER BY specialization"
+                )
+                return json.dumps({
+                    "status": "not_found",
+                    "message": f"No doctors found for '{specialization}'.",
+                    "available": [r["specialization"] for r in all_specs],
+                    "what_each_treats": SPECIALIZATIONS,
+                })
 
         return json.dumps({
             "status": "ok", "specialization": spec,
             "description": SPECIALIZATIONS.get(spec, "Dental specialist"),
-            "doctors": [{"name": d["doctor_name"].title(), "specialization": d["specialization"],
-                         "experience": f"{d['years_exp']} years", "bio": d["bio"],
-                         "open_slots_30d": d.get("open_slots", 0)} for d in doctors],
+            "doctors": [
+                {
+                    "name": d["doctor_name"].title(),
+                    "specialization": d["specialization"],
+                    "experience": f"{d['years_exp']} years",
+                    "bio": d["bio"],
+                    "open_slots_30d": d.get("open_slots", 0),
+                }
+                for d in doctors
+            ],
         })
 
     except Exception as exc:
@@ -412,77 +442,108 @@ def booking_agent(
 ) -> str:
     """
     Book a dental appointment atomically.
-    Verifies availability → creates appointment → marks slot booked → returns confirmation.
+    Verifies availability, creates the appointment record,
+    marks the slot as booked, and returns a confirmation code.
 
     Args:
         patient_id:    Patient's numeric ID (e.g., 1000048)
         doctor_name:   Doctor's full name (e.g., 'john doe')
         date_slot:     Appointment datetime ('2026-07-08 09:00:00')
         reason:        Reason for visit (e.g., 'Teeth cleaning')
-        patient_email: Optional email for patient record
+        patient_email: Optional email to store on the patient record
 
     Returns:
         JSON with confirmation code and appointment details, or failure reason.
     """
     try:
         with DBManager() as db:
+            # Step 1: Verify slot is free
             slot = db.query_one(
                 "SELECT slot_id, is_available, specialization, slot_duration_min "
                 "FROM doctor_availability WHERE doctor_name = %s AND date_slot = %s",
                 (doctor_name.lower(), date_slot),
             )
             if not slot:
-                return json.dumps({"status": "error",
-                                   "message": f"No slot for Dr. {doctor_name} at {date_slot}. "
-                                              "Use get_availability to find valid slots."})
+                return json.dumps({
+                    "status": "error",
+                    "message": f"No slot found for Dr. {doctor_name} at {date_slot}. "
+                               "Use get_availability to find valid slots.",
+                })
             if not slot["is_available"]:
-                return json.dumps({"status": "slot_taken",
-                                   "message": "Slot already booked. Use get_availability to find a free one."})
+                return json.dumps({
+                    "status": "slot_taken",
+                    "message": "Slot is already booked. Use get_availability to find a free one.",
+                })
 
-            # Upsert patient
-            patient = db.query_one("SELECT patient_id FROM patients WHERE patient_id = %s", (patient_id,))
+            # Step 2: Upsert patient
+            patient = db.query_one(
+                "SELECT patient_id FROM patients WHERE patient_id = %s", (patient_id,)
+            )
             if not patient:
                 db.execute(
                     "INSERT INTO patients (patient_id, first_name, last_name, email) "
                     "VALUES (%s, %s, %s, %s) ON CONFLICT (patient_id) DO NOTHING",
-                    (patient_id, "New", "Patient", patient_email or f"patient{patient_id}@clinic.com"),
+                    (patient_id, "New", "Patient",
+                     patient_email or f"patient{patient_id}@clinic.com"),
                 )
 
             code = _conf_code(patient_id)
 
-            # Mark slot booked
+            # Step 3: Mark slot booked
             db.execute(
-                "UPDATE doctor_availability SET is_available = FALSE, patient_to_attend = %s "
+                "UPDATE doctor_availability "
+                "SET is_available = FALSE, patient_to_attend = %s "
                 "WHERE doctor_name = %s AND date_slot = %s",
                 (patient_id, doctor_name.lower(), date_slot),
             )
 
-            # Create appointment record
+            # Step 4: Create appointment record
+            # FIX: "RETURNING id" added — appointments.id is SERIAL PRIMARY KEY.
+            # db_connection.execute() returns the first integer from the RETURNING row.
             appt_id = db.execute(
                 "INSERT INTO appointments "
-                "(patient_id, doctor_name, specialization, appointment_dt, reason, confirmation_code, status) "
-                "VALUES (%s, %s, %s, %s, %s, %s, 'scheduled')",
-                (patient_id, doctor_name.lower(), slot["specialization"], date_slot, reason, code),
+                "(patient_id, doctor_name, specialization, appointment_dt, "
+                " reason, confirmation_code, status) "
+                "VALUES (%s, %s, %s, %s, %s, %s, 'scheduled') RETURNING id",
+                (patient_id, doctor_name.lower(), slot["specialization"],
+                 date_slot, reason, code),
             )
 
+            # Step 5: Update email if provided
             if patient_email:
-                db.execute("UPDATE patients SET email = %s WHERE patient_id = %s", (patient_email, patient_id))
+                db.execute(
+                    "UPDATE patients SET email = %s WHERE patient_id = %s",
+                    (patient_email, patient_id),
+                )
 
+            # Step 6: Log session
+            # FIX: ON CONFLICT (session_id) — required because session_id is the PK.
+            # No RETURNING id — conversation_sessions has no id column.
             db.execute(
-                "INSERT INTO conversation_sessions (session_id, patient_id, intent, outcome, appointment_id) "
-                "VALUES (%s, %s, 'booking', 'success', %s) ON CONFLICT DO NOTHING",
+                "INSERT INTO conversation_sessions "
+                "(session_id, patient_id, intent, outcome, appointment_id) "
+                "VALUES (%s, %s, 'booking', 'success', %s) "
+                "ON CONFLICT (session_id) DO NOTHING",
                 (f"auto-{appt_id}", patient_id, appt_id),
             )
 
         dt = datetime.strptime(date_slot, "%Y-%m-%d %H:%M:%S")
         return json.dumps({
-            "status": "booked", "confirmation_code": code,
-            "appointment_id": appt_id, "patient_id": patient_id,
-            "doctor": doctor_name.title(), "specialization": slot["specialization"],
-            "date": dt.strftime("%A, %B %d, %Y"), "time": dt.strftime("%I:%M %p"),
-            "duration": f"{slot['slot_duration_min']} minutes", "reason": reason,
-            "message": f"Appointment confirmed! Code: {code}. Arrive 10 min early. "
-                       "Call (555) DENTIST to cancel or reschedule.",
+            "status": "booked",
+            "confirmation_code": code,
+            "appointment_id": appt_id,
+            "patient_id": patient_id,
+            "doctor": doctor_name.title(),
+            "specialization": slot["specialization"],
+            "date": dt.strftime("%A, %B %d, %Y"),
+            "time": dt.strftime("%I:%M %p"),
+            "duration": f"{slot['slot_duration_min']} minutes",
+            "reason": reason,
+            "message": (
+                f"Appointment confirmed! Code: {code}. "
+                f"Please arrive 10 minutes early. "
+                f"Call (555) DENTIST to cancel or reschedule."
+            ),
         })
 
     except Exception as exc:
@@ -520,22 +581,31 @@ def cancellation_agent(
                 (confirmation_code, patient_id),
             )
             if not appt:
-                return json.dumps({"status": "not_found",
-                                   "message": "No appointment found with that code and patient ID."})
+                return json.dumps({
+                    "status": "not_found",
+                    "message": "No appointment found with that code and patient ID.",
+                })
             if appt["status"] in ("cancelled", "completed"):
-                return json.dumps({"status": "already_done",
-                                   "message": f"Appointment already {appt['status']}."})
+                return json.dumps({
+                    "status": "already_done",
+                    "message": f"Appointment already {appt['status']}.",
+                })
 
             appt_dt = appt["appointment_dt"]
             if isinstance(appt_dt, datetime):
                 hours = (appt_dt - datetime.now()).total_seconds() / 3600
                 if 0 < hours < 2:
-                    return json.dumps({"status": "too_late",
-                                       "message": f"Less than 2 h away ({hours:.1f}h). Call (555) DENTIST directly."})
+                    return json.dumps({
+                        "status": "too_late",
+                        "message": (
+                            f"Less than 2h away ({hours:.1f}h). "
+                            "Please call (555) DENTIST directly."
+                        ),
+                    })
 
             db.execute(
-                "UPDATE appointments SET status='cancelled', cancelled_at=NOW(), cancellation_reason=%s "
-                "WHERE id = %s",
+                "UPDATE appointments SET status='cancelled', cancelled_at=NOW(), "
+                "cancellation_reason=%s WHERE id = %s",
                 (cancellation_reason or "Patient request", appt["id"]),
             )
             db.execute(
@@ -545,11 +615,16 @@ def cancellation_agent(
             )
 
         return json.dumps({
-            "status": "cancelled", "appointment_id": appt["id"],
-            "confirmation_code": confirmation_code, "doctor": appt["doctor_name"].title(),
+            "status": "cancelled",
+            "appointment_id": appt["id"],
+            "confirmation_code": confirmation_code,
+            "doctor": appt["doctor_name"].title(),
             "was_scheduled_for": str(appt_dt)[:16],
-            "message": f"Appointment on {str(appt_dt)[:16]} with Dr. {appt['doctor_name'].title()} "
-                       "has been cancelled. Slot is now open for others.",
+            "message": (
+                f"Appointment on {str(appt_dt)[:16]} with Dr. "
+                f"{appt['doctor_name'].title()} has been cancelled. "
+                "Slot is now open for others."
+            ),
         }, default=str)
 
     except Exception as exc:
@@ -588,18 +663,24 @@ def rescheduling_agent(
                 (confirmation_code, patient_id),
             )
             if not appt:
-                return json.dumps({"status": "not_found", "message": "Appointment not found."})
+                return json.dumps({"status": "not_found",
+                                   "message": "Appointment not found. Check code and patient ID."})
             if appt["status"] in ("cancelled", "completed"):
-                return json.dumps({"status": "invalid_status",
-                                   "message": f"Cannot reschedule — appointment is already {appt['status']}."})
+                return json.dumps({
+                    "status": "invalid_status",
+                    "message": f"Cannot reschedule — appointment is already {appt['status']}.",
+                })
 
             new_slot = db.query_one(
-                "SELECT is_available FROM doctor_availability WHERE doctor_name=%s AND date_slot=%s",
+                "SELECT is_available FROM doctor_availability "
+                "WHERE doctor_name=%s AND date_slot=%s",
                 (appt["doctor_name"], new_date_slot),
             )
             if not new_slot:
-                return json.dumps({"status": "slot_not_found",
-                                   "message": f"No entry for {new_date_slot}. Use get_availability first."})
+                return json.dumps({
+                    "status": "slot_not_found",
+                    "message": f"No entry for {new_date_slot}. Use get_availability first.",
+                })
             if not new_slot["is_available"]:
                 return json.dumps({"status": "slot_taken",
                                    "message": f"{new_date_slot} is already booked."})
@@ -626,13 +707,17 @@ def rescheduling_agent(
         old_dt = str(appt["appointment_dt"])[:16]
         new_dt = datetime.strptime(new_date_slot, "%Y-%m-%d %H:%M:%S")
         return json.dumps({
-            "status": "rescheduled", "old_confirmation": confirmation_code,
-            "new_confirmation": new_code, "doctor": appt["doctor_name"].title(),
+            "status": "rescheduled",
+            "old_confirmation": confirmation_code,
+            "new_confirmation": new_code,
+            "doctor": appt["doctor_name"].title(),
             "old_datetime": old_dt,
             "new_date": new_dt.strftime("%A, %B %d, %Y"),
             "new_time": new_dt.strftime("%I:%M %p"),
-            "message": f"Rescheduled! Old slot ({old_dt}) freed. "
-                       f"New: {new_dt.strftime('%A %B %d at %I:%M %p')} — Code: {new_code}",
+            "message": (
+                f"Rescheduled! Old slot ({old_dt}) freed. "
+                f"New: {new_dt.strftime('%A %B %d at %I:%M %p')} — Code: {new_code}"
+            ),
         }, default=str)
 
     except Exception as exc:
@@ -651,7 +736,7 @@ ALL_TOOLS = [
 _tool_node = ToolNode(ALL_TOOLS)
 
 # ──────────────────────────────────────────────────────────
-# SYSTEM PROMPTS — defined once at module level
+# SYSTEM PROMPTS
 # ──────────────────────────────────────────────────────────
 
 _SYS_EMERGENCY = SystemMessage(content="""
@@ -663,7 +748,7 @@ PROTOCOL:
 4. Abscess: cold pack only — NOT heat
 5. Use get_availability to check emergency slots; offer to book NOW
 6. OTC pain relief: ibuprofen (if not contraindicated) + cold pack
-Emergency dentists: Daniel Miller, Susan Davis | (555) DENTIST
+Emergency dentists: Daniel Miller, Susan Davis | 0800 DENTIST
 """.strip())
 
 _SYS_CANCEL = SystemMessage(content="""
@@ -674,7 +759,7 @@ WORKFLOW:
 3. No code? use get_patient_appointments to find it
 4. Use cancellation_agent
 5. Confirm cancellation; offer to rebook
-6. Within 2 h: direct to (555) DENTIST
+6. Within 2 h: direct to 0800 DENTIST
 """.strip())
 
 _SYS_RESCHEDULE = SystemMessage(content="""
@@ -701,24 +786,23 @@ WORKFLOW:
 
 _SYS_GENERAL = SystemMessage(content="""
 You are the friendly AI assistant for DentAI Pro Dental Clinic.
-Hours: Mon–Fri 8am–4:30pm | Sat 9am–2pm | Emergency: (555) DENTIST
+Hours: Mon–Fri 8am–4:30pm | Sat 9am–2pm | Emergency: 0800 DENTIST
 
 You can help with: booking, cancellations, rescheduling, procedure questions,
 specialist routing, emergencies, insurance, and dental health tips.
 
 DENTAL ANXIETY: acknowledge warmly; mention gentle dentists, modern anaesthesia, sedation.
-FAQ: Cleaning 30–60 min every 6 months | Filling 30–45 min | Root canal 60–90 min | Whitening 90 min.
+FAQ: Cleaning 30–60 min every 6 months | Filling 30–45 min | Root canal 60–90 min.
 Always end with a clear next-step offer.
 """.strip())
+
 
 # ──────────────────────────────────────────────────────────
 # NODES
 # ──────────────────────────────────────────────────────────
 
 def triage_node(state: DentalState) -> DentalState:
-    """Pure-Python classifier — no LLM call, deterministic, zero cost."""
     msg = state["messages"][-1].content.lower()
-
     is_emergency = any(kw in msg for kw in EMERGENCY_KEYWORDS)
 
     if is_emergency:
@@ -743,18 +827,28 @@ def triage_node(state: DentalState) -> DentalState:
     analytics = list(state.get("analytics", []))
     analytics.append(f"triage|intent={intent}|emergency={is_emergency}|spec={detected_spec}")
 
-    return {**state, "is_emergency": is_emergency, "detected_intent": intent,
-            "detected_specialization": detected_spec, "current_node": "triage", "analytics": analytics}
+    return {
+        **state,
+        "is_emergency": is_emergency,
+        "detected_intent": intent,
+        "detected_specialization": detected_spec,
+        "current_node": "triage",
+        "analytics": analytics,
+    }
 
 
 def emergency_node(state: DentalState) -> DentalState:
     llm = get_llm(0.15).bind_tools([get_availability, booking_agent])
-    return {**state, "messages": [llm.invoke([_SYS_EMERGENCY] + state["messages"])], "current_node": "emergency"}
+    return {**state, "messages": [llm.invoke([_SYS_EMERGENCY] + state["messages"])],
+            "current_node": "emergency"}
 
 
 def booking_node(state: DentalState) -> DentalState:
     spec = state.get("detected_specialization")
-    hint = f"\nDetected procedure need: {spec}. Use list_doctors_by_specialization('{spec}') first." if spec else ""
+    hint = (
+        f"\nDetected procedure need: {spec}. "
+        f"Use list_doctors_by_specialization('{spec}') first."
+    ) if spec else ""
     system = SystemMessage(content=f"""
 You are a professional dental scheduler at DentAI Pro — warm, efficient, expert.
 BOOKING WORKFLOW:
@@ -770,22 +864,26 @@ crowns/implants → prosthodontist | wisdom/extractions → oral_surgeon |
 severe pain → emergency_dentist{hint}
 """.strip())
     llm = get_llm(0.3).bind_tools(ALL_TOOLS)
-    return {**state, "messages": [llm.invoke([system] + state["messages"])], "current_node": "booking"}
+    return {**state, "messages": [llm.invoke([system] + state["messages"])],
+            "current_node": "booking"}
 
 
 def cancel_node(state: DentalState) -> DentalState:
     llm = get_llm(0.3).bind_tools([get_patient_appointments, cancellation_agent])
-    return {**state, "messages": [llm.invoke([_SYS_CANCEL] + state["messages"])], "current_node": "cancel"}
+    return {**state, "messages": [llm.invoke([_SYS_CANCEL] + state["messages"])],
+            "current_node": "cancel"}
 
 
 def reschedule_node(state: DentalState) -> DentalState:
     llm = get_llm(0.3).bind_tools([get_patient_appointments, get_availability, rescheduling_agent])
-    return {**state, "messages": [llm.invoke([_SYS_RESCHEDULE] + state["messages"])], "current_node": "reschedule"}
+    return {**state, "messages": [llm.invoke([_SYS_RESCHEDULE] + state["messages"])],
+            "current_node": "reschedule"}
 
 
 def patient_history_node(state: DentalState) -> DentalState:
     llm = get_llm(0.3).bind_tools([get_patient_appointments])
-    return {**state, "messages": [llm.invoke([_SYS_HISTORY] + state["messages"])], "current_node": "patient_history"}
+    return {**state, "messages": [llm.invoke([_SYS_HISTORY] + state["messages"])],
+            "current_node": "patient_history"}
 
 
 def doctor_info_node(state: DentalState) -> DentalState:
@@ -795,12 +893,14 @@ SPECIALIZATIONS:\n{_SPECS_JSON}
 WORKFLOW: listen → recommend specialization → list_doctors_by_specialization → offer to book
 """.strip())
     llm = get_llm(0.4).bind_tools([list_doctors_by_specialization, get_availability])
-    return {**state, "messages": [llm.invoke([system] + state["messages"])], "current_node": "doctor_info"}
+    return {**state, "messages": [llm.invoke([system] + state["messages"])],
+            "current_node": "doctor_info"}
 
 
 def general_node(state: DentalState) -> DentalState:
     llm = get_llm(0.5)
-    return {**state, "messages": [llm.invoke([_SYS_GENERAL] + state["messages"])], "current_node": "general"}
+    return {**state, "messages": [llm.invoke([_SYS_GENERAL] + state["messages"])],
+            "current_node": "general"}
 
 
 # ──────────────────────────────────────────────────────────
@@ -812,11 +912,14 @@ _INTENT_MAP: dict[str, str] = {
     "reschedule": "reschedule", "patient_history": "patient_history",
     "doctor_info": "doctor_info", "general": "general",
 }
-_ACTION_NODES = frozenset(("emergency", "booking", "cancel", "reschedule", "patient_history", "doctor_info"))
+_ACTION_NODES = frozenset(
+    ("emergency", "booking", "cancel", "reschedule", "patient_history", "doctor_info")
+)
 
 
 def _route_triage(state: DentalState) -> str:
-    return "emergency" if state["is_emergency"] else _INTENT_MAP.get(state.get("detected_intent", "general"), "general")
+    return "emergency" if state["is_emergency"] else \
+        _INTENT_MAP.get(state.get("detected_intent", "general"), "general")
 
 
 def _route_after_action(state: DentalState) -> str:
@@ -835,10 +938,11 @@ def _route_after_tools(state: DentalState) -> str:
 def build_graph():
     g = StateGraph(DentalState)
     for name, fn in {
-        "triage": triage_node, "emergency": emergency_node, "booking": booking_node,
-        "cancel": cancel_node, "reschedule": reschedule_node,
-        "patient_history": patient_history_node, "doctor_info": doctor_info_node,
-        "general": general_node, "tools": _tool_node,
+        "triage": triage_node, "emergency": emergency_node,
+        "booking": booking_node, "cancel": cancel_node,
+        "reschedule": reschedule_node, "patient_history": patient_history_node,
+        "doctor_info": doctor_info_node, "general": general_node,
+        "tools": _tool_node,
     }.items():
         g.add_node(name, fn)
 
@@ -848,17 +952,19 @@ def build_graph():
     for node in _ACTION_NODES:
         g.add_conditional_edges(node, _route_after_action, {"tools": "tools", END: END})
 
-    g.add_conditional_edges("tools", _route_after_tools,
-                            {n: n for n in _ACTION_NODES} | {"general": "general"})
+    g.add_conditional_edges(
+        "tools", _route_after_tools,
+        {n: n for n in _ACTION_NODES} | {"general": "general"},
+    )
     g.add_edge("general", END)
     return g.compile()
 
 
 # ──────────────────────────────────────────────────────────
-# PUBLIC API — called by Streamlit, WhatsApp, Telegram bots
+# PUBLIC API
 # ──────────────────────────────────────────────────────────
 
-_graph = None   # lazy singleton
+_graph = None
 
 
 def get_graph():
@@ -868,16 +974,23 @@ def get_graph():
     return _graph
 
 
-def run_agent(message: str, session_id: str, channel: str = "web") -> dict:
+def run_agent(
+    message: str,
+    session_id: str,
+    channel: str = "web",
+    patient_id: Optional[int] = None,   # FIX: added — streamlit_app passes this
+) -> dict:
     """
-    Single-turn agent call. Returns a dict with:
-        reply       (str)  — plain text response for any channel
+    Single-turn agent call. Returns:
+        reply        (str)  — plain text for any channel
         is_emergency (bool)
-        intent      (str)
-        analytics   (list)
+        intent       (str)
+        analytics    (list)
     """
-    result = get_graph().invoke(make_state(message, session_id, channel))
-    ai_msg = next((m for m in reversed(result["messages"]) if isinstance(m, AIMessage)), None)
+    result = get_graph().invoke(make_state(message, session_id, channel, patient_id))
+    ai_msg = next(
+        (m for m in reversed(result["messages"]) if isinstance(m, AIMessage)), None
+    )
     return {
         "reply":        ai_msg.content if ai_msg else "I'm sorry, something went wrong.",
         "is_emergency": result.get("is_emergency", False),
@@ -887,7 +1000,7 @@ def run_agent(message: str, session_id: str, channel: str = "web") -> dict:
 
 
 # ──────────────────────────────────────────────────────────
-# CLI (for local dev / testing)
+# CLI
 # ──────────────────────────────────────────────────────────
 
 def _cli() -> None:
@@ -911,7 +1024,7 @@ def _cli() -> None:
         out = run_agent(user_input, sid, channel="cli")
         print(f"\nDentAI: {out['reply']}\n")
         if out["is_emergency"]:
-            print("  [EMERGENCY DETECTED — call (555) DENTIST]\n")
+            print("  [EMERGENCY DETECTED — call 0800 DENTIST]\n")
 
 
 if __name__ == "__main__":
